@@ -27,7 +27,7 @@ def main(cfg: DictConfig):
         wandb_run.define_metric("processed", summary="max")
         run_id = wandb_run.id
 
-    output_dir = Path(cfg.output_dir, cfg.experiment_name, run_id)
+    output_dir = Path(cfg.output_dir, cfg.experiment_name)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     mask_save_dir = Path(output_dir, "masks")
