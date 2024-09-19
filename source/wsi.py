@@ -9,16 +9,12 @@ import multiprocessing as mp
 
 from PIL import Image
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Union
 
-from source.utils import save_hdf5, save_patch, compute_time, find_common_spacings
+from source.utils import save_hdf5, save_npy, save_patch, compute_time, find_common_spacings
 from source.util_classes import (
     Contour_Checking_fn,
-    isInContourV1,
-    isInContourV2,
-    isInContourV3_Easy,
-    isInContourV3_Hard,
-    isInContour_pct,
+    HasEnoughTissue,
 )
 
 import warnings
@@ -31,7 +27,13 @@ Image.MAX_IMAGE_PIXELS = 933120000
 
 class WholeSlideImage(object):
     def __init__(
-        self, path: Path, spacing: Optional[float] = None, backend: str = "asap"
+        self,
+        path: Path,
+        mask_path: Optional[Path] = None,
+        spacing: Optional[float] = None,
+        downsample: int = 64,
+        backend: str = "asap",
+        segment: bool = False,
     ):
         """
         Args:
@@ -39,14 +41,23 @@ class WholeSlideImage(object):
         """
 
         self.path = path
-        self.name = path.stem
+        self.name = path.stem.replace(" ", "_")
         self.fmt = path.suffix
         self.wsi = wsd.WholeSlideImage(path, backend=backend)
+
+        self.spacing = spacing # manually set spacing at level 0
+        self.spacings = self.get_spacings()
         self.level_dimensions = self.wsi.shapes
         self.level_downsamples = self.get_downsamples()
-        self.spacing = spacing
-        self.spacings = self.get_spacings()
         self.backend = backend
+
+        self.mask_path = mask_path
+        if mask_path is not None:
+            self.mask = wsd.WholeSlideImage(mask_path, backend=backend)
+            if segment:
+                self.seg_level = self.load_segmentation(downsample)
+        elif segment:
+            self.seg_level = self.segment_tissue(downsample)
 
         self.contours_tissue = None
         self.contours_tumor = None
@@ -62,6 +73,10 @@ class WholeSlideImage(object):
     def get_spacings(self):
         if self.spacing is None:
             spacings = self.wsi.spacings
+            if len(set(spacings).difference(set([float("inf")]))) == 0:
+                raise ValueError(
+                    "ERROR: The slide spacings are all infinity."
+                )
         else:
             spacings = [
                 self.spacing * s / self.wsi.spacings[0] for s in self.wsi.spacings
@@ -80,10 +95,10 @@ class WholeSlideImage(object):
             target_downsample, return_tol_status=True
         )
         level_spacing = self.get_level_spacing(level)
-        resize_factor = int(target_spacing / level_spacing)
+        resize_factor = int(round(target_spacing / level_spacing, 0))
         if above_tol and not ignore_warning:
             print(
-                f"WARNING! The natural spacing ({round(self.spacings[level],4)}) closest to the target spacing ({round(target_spacing,4)}) was more than {tol*100:.1f}% appart ({self.name})."
+                f"WARNING! The natural spacing ({resize_factor*self.spacings[level]:.4f}) closest to the target spacing ({target_spacing:.4f}) was more than {tol*100:.1f}% appart ({self.name})."
             )
         return level, resize_factor
 
@@ -98,35 +113,19 @@ class WholeSlideImage(object):
         else:
             return level
 
-    def initSegmentation(self, mask_fp: Path):
-        # load segmentation results from pickle file
-        import pickle
-
-        with open(mask_fp, "rb") as f:
-            asset_dict = pickle.load(f)
-            self.holes_tissue = asset_dict["holes"]
-            self.contours_tissue = asset_dict["tissue"]
-
-    def loadSegmentation(
+    def load_segmentation(
         self,
-        mask_fp: Path,
-        spacing: float,
         downsample: int,
-        filter_params,
         sthresh_up: int = 255,
-        tissue_val: int = 1,
-        try_previous_level: bool = True,
+        tissue_val: Union[int, List[int]] = 1,
     ):
-
-        mask = WholeSlideImage(mask_fp, backend=self.backend)
-
         # ensure mask and slide have at least one common spacing
         common_spacings = find_common_spacings(
-            self.spacings, mask.spacings, tolerance=0.1
+            self.spacings, self.mask.spacings, tolerance=0.1
         )
         assert (
             len(common_spacings) >= 1
-        ), f"The provided segmentation mask (spacings={mask.spacings}) has no common spacing with the slide (spacings={self.spacings}). A minimum of 1 common spacing is required."
+        ), f"The provided segmentation mask (spacings={self.mask.spacings}) has no common spacing with the slide (spacings={self.spacings}). A minimum of 1 common spacing is required."
 
         seg_level = self.get_best_level_for_downsample_custom(downsample)
         seg_spacing = self.get_level_spacing(seg_level)
@@ -142,33 +141,35 @@ class WholeSlideImage(object):
                 seg_spacing, ignore_warning=True
             )
 
-        m = mask.wsi.get_slide(spacing=seg_spacing)
+        m = self.mask.get_slide(spacing=seg_spacing)
         m = m[..., 0]
 
-        m = (m == tissue_val).astype("uint8")
+        if isinstance(tissue_val, int):
+            tissue_val = [tissue_val]
+        m = np.isin(m, tissue_val).astype("uint8")
+
         if np.max(m) <= 1:
             m = m * sthresh_up
 
         self.binary_mask = m
-        self.detect_contours(m, spacing, seg_level, filter_params)
         return seg_level
 
-    def segmentTissue(
+    def segment_tissue(
         self,
-        spacing: float,
-        seg_level: int = 0,
+        downsample: int,
         sthresh: int = 20,
         sthresh_up: int = 255,
         mthresh: int = 7,
         close: int = 0,
         use_otsu: bool = False,
-        filter_params: Dict[str, int] = {"ref_patch_size": 512, "a_t": 1, "a_h": 1},
     ):
         """
         Segment the tissue via HSV -> Median thresholding -> Binary threshold
         """
 
+        seg_level = self.get_best_level_for_downsample_custom(downsample)
         seg_spacing = self.get_level_spacing(seg_level)
+
         img = self.wsi.get_slide(spacing=seg_spacing)
         img = np.array(Image.fromarray(img).convert("RGBA"))
         img_hsv = cv2.cvtColor(img, cv2.COLOR_RGB2HSV)  # Convert to HSV space
@@ -190,10 +191,10 @@ class WholeSlideImage(object):
             img_thresh = cv2.morphologyEx(img_thresh, cv2.MORPH_CLOSE, kernel)
 
         self.binary_mask = img_thresh
-        self.detect_contours(img_thresh, spacing, seg_level, filter_params)
+        return seg_level
 
     def detect_contours(
-        self, img_thresh, spacing: float, seg_level: int, filter_params: Dict[str, int]
+        self, spacing: float, seg_level: int, filter_params: Dict[str, int]
     ):
         def _filter_contours(contours, hierarchy, filter_params):
             """
@@ -259,10 +260,13 @@ class WholeSlideImage(object):
 
         # Find and filter contours
         contours, hierarchy = cv2.findContours(
-            img_thresh, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_NONE
+            self.binary_mask, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_NONE
         )  # Find contours
-        # contours, hierarchy = cv2.findContours(img_thresh, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE) # Find contours
-        hierarchy = np.squeeze(hierarchy, axis=(0,))[:, 2:]
+        # contours, hierarchy = cv2.findContours(self.binary_mask, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE) # Find contours
+        if hierarchy is not None:
+            hierarchy = np.squeeze(hierarchy, axis=(0,))[:, 2:]
+        else:
+            raise ValueError("ERROR: No contours found in the binary mask.")
         if filter_params:
             # Necessary for filtering out artifacts
             foreground_contours, hole_contours = _filter_contours(
@@ -273,9 +277,9 @@ class WholeSlideImage(object):
         self.contours_tissue = self.scaleContourDim(foreground_contours, target_scale)
         self.holes_tissue = self.scaleHolesDim(hole_contours, target_scale)
 
-    def visWSI(
+    def visualize_mask(
         self,
-        vis_level: int = 0,
+        downsample: int,
         color: Tuple[int] = (0, 255, 0),
         hole_color: Tuple[int] = (0, 0, 255),
         annot_color: Tuple[int] = (255, 0, 0),
@@ -290,8 +294,9 @@ class WholeSlideImage(object):
         annot_display: bool = True,
     ):
 
-        downsample = self.level_downsamples[vis_level]
-        scale = [1 / downsample[0], 1 / downsample[1]]
+        vis_level = self.get_best_level_for_downsample_custom(downsample)
+        level_downsample = self.level_downsamples[vis_level]
+        scale = [1 / level_downsample[0], 1 / level_downsample[1]]
 
         if top_left is not None and bot_right is not None:
             top_left = tuple(top_left)
@@ -385,7 +390,7 @@ class WholeSlideImage(object):
             resizeFactor = max_size / w if w > h else max_size / h
             img = img.resize((int(w * resizeFactor), int(h * resizeFactor)))
 
-        return img
+        return img, vis_level
 
     @staticmethod
     def isInHoles(holes, pt, patch_size):
@@ -437,17 +442,28 @@ class WholeSlideImage(object):
         patch_format: str = "png",
         top_left: Optional[List[int]] = None,
         bot_right: Optional[List[int]] = None,
+        spacing_tol: float = 0.1,
         num_workers: int = 1,
+        save_hdf5_flag: bool = False,
+        save_npy_flag: bool = False,
         verbose: bool = False,
     ):
-        save_flag = save_dir is not None
+        save_flag = save_dir is not None and (save_hdf5_flag or save_npy_flag or save_patches_to_disk)
+        save_path_hdf5 = None
+        save_path_npy = None
+        patch_save_dir = None
         if save_flag:
-            if save_patches_in_common_dir:
-                save_path_hdf5 = Path(save_dir.parent, "h5", f"{self.name}.h5")
-            else:
-                save_path_hdf5 = Path(save_dir, f"{self.name}.h5")
-        else:
-            save_path_hdf5 = None
+            if save_hdf5_flag:
+                save_path_hdf5 = Path(save_dir, "h5", f"{self.name}.h5")
+            if save_npy_flag:
+                save_path_npy = Path(save_dir, "npy", f"{self.name}.npy")
+            if save_patches_to_disk:
+                if save_patches_in_common_dir:
+                    patch_save_dir = Path(save_dir, "imgs")
+                else:
+                    patch_save_dir = Path(save_dir, f"{patch_format}", f"{self.name}")
+                patch_save_dir.mkdir(parents=True, exist_ok=True)
+
         start_time = time.time()
         n_contours = len(self.contours_tissue)
         if verbose:
@@ -463,7 +479,7 @@ class WholeSlideImage(object):
                 self.holes_tissue[i],
                 seg_level,
                 spacing,
-                save_dir,
+                patch_save_dir,
                 patch_size,
                 overlap,
                 contour_fn,
@@ -472,6 +488,7 @@ class WholeSlideImage(object):
                 use_padding,
                 top_left,
                 bot_right,
+                spacing_tol,
                 num_workers=num_workers,
                 verbose=verbose,
             )
@@ -482,8 +499,7 @@ class WholeSlideImage(object):
                     if save_patches_in_common_dir:
                         tile_df["tile_path"] = tile_df.apply(
                             lambda row: Path(
-                                save_dir.parent,
-                                "imgs",
+                                patch_save_dir,
                                 f"{row.slide_id}_{row.x}_{row.y}.{patch_format}",
                             ).resolve(),
                             axis=1,
@@ -491,7 +507,7 @@ class WholeSlideImage(object):
                     else:
                         tile_df["tile_path"] = tile_df.apply(
                             lambda row: Path(
-                                save_dir, "imgs", f"{row.x}_{row.y}.{patch_format}"
+                                patch_save_dir, f"{row.x}_{row.y}.{patch_format}"
                             ).resolve(),
                             axis=1,
                         )
@@ -502,17 +518,19 @@ class WholeSlideImage(object):
 
             if len(asset_dict) > 0 and save_flag:
                 if init:
-                    save_path_hdf5.parent.mkdir(parents=True, exist_ok=True)
-                    save_hdf5(save_path_hdf5, asset_dict, attr_dict, mode="w")
+                    if save_hdf5_flag:
+                        save_path_hdf5.parent.mkdir(parents=True, exist_ok=True)
+                        save_hdf5(save_path_hdf5, asset_dict, attr_dict, mode="w")
                     init = False
+                    if save_npy_flag:
+                        save_path_npy.parent.mkdir(parents=True, exist_ok=True)
+                        save_npy(save_path_npy, asset_dict, attr_dict, mode="w")
                 else:
-                    save_hdf5(save_path_hdf5, asset_dict, mode="a")
+                    if save_hdf5_flag:
+                        save_hdf5(save_path_hdf5, asset_dict, mode="a")
+                    if save_npy_flag:
+                        save_npy(save_path_npy, asset_dict, attr_dict, mode="a")
                 if save_patches_to_disk:
-                    if save_patches_in_common_dir:
-                        patch_save_dir = Path(save_dir.parent, "imgs")
-                    else:
-                        patch_save_dir = Path(save_dir, "imgs")
-                    patch_save_dir.mkdir(parents=True, exist_ok=True)
                     npatch, mins, secs = save_patch(
                         self.wsi,
                         patch_save_dir,
@@ -528,7 +546,7 @@ class WholeSlideImage(object):
             df = pd.concat(dfs, ignore_index=True)
         else:
             df = None
-        return save_path_hdf5, df
+        return save_path_hdf5, save_path_npy, df
 
     def process_contour(
         self,
@@ -545,6 +563,7 @@ class WholeSlideImage(object):
         use_padding: bool = True,
         top_left: Optional[List[int]] = None,
         bot_right: Optional[List[int]] = None,
+        spacing_tol: float = 0.1,
         num_workers: int = 1,
         verbose: bool = False,
     ):
@@ -554,7 +573,11 @@ class WholeSlideImage(object):
         )
 
         patch_spacing = self.get_level_spacing(patch_level)
-        resize_factor = int(spacing / patch_spacing)
+        resize_factor = int(round(spacing / patch_spacing, 0))
+
+        if abs(resize_factor*patch_spacing/spacing - 1) > spacing_tol:
+            raise ValueError(f"ERROR: The natural spacing ({resize_factor*patch_spacing:.4f}) closest to the target spacing ({spacing:.4f}) was more than {spacing_tol*100}% apart.")
+
         patch_size_resized = patch_size * resize_factor
         step_size = int(patch_size_resized * (1.0 - overlap))
 
@@ -576,8 +599,8 @@ class WholeSlideImage(object):
             int(self.level_downsamples[patch_level][1]),
         )
         ref_patch_size = (
-            patch_size * patch_downsample[0],
-            patch_size * patch_downsample[1],
+            patch_size_resized * patch_downsample[0],
+            patch_size_resized * patch_downsample[1],
         )
 
         img_w, img_h = self.level_dimensions[0]
@@ -609,24 +632,10 @@ class WholeSlideImage(object):
 
         # TODO: work with the ref_patch_size tuple instead of using ref_patch_size[0] to account for difference along x & y axes
         if isinstance(contour_fn, str):
-            if contour_fn == "four_pt":
-                cont_check_fn = isInContourV3_Easy(
-                    contour=cont, patch_size=ref_patch_size[0], center_shift=0.5
-                )
-            elif contour_fn == "four_pt_hard":
-                cont_check_fn = isInContourV3_Hard(
-                    contour=cont, patch_size=ref_patch_size[0], center_shift=0.5
-                )
-            elif contour_fn == "center":
-                cont_check_fn = isInContourV2(
-                    contour=cont, patch_size=ref_patch_size[0]
-                )
-            elif contour_fn == "basic":
-                cont_check_fn = isInContourV1(contour=cont)
-            elif contour_fn == "pct":
+            if contour_fn == "pct":
                 scale = self.level_downsamples[seg_level]
                 cont = self.scaleContourDim([cont], (1.0 / scale[0], 1.0 / scale[1]))[0]
-                cont_check_fn = isInContour_pct(
+                cont_check_fn = HasEnoughTissue(
                     contour=cont,
                     contour_holes=contour_holes,
                     tissue_mask=self.binary_mask,

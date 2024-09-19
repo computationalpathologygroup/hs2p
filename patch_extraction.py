@@ -1,7 +1,8 @@
 import os
+import time
 import tqdm
 import wandb
-import hydra
+import argparse
 import datetime
 import threading
 import numpy as np
@@ -9,16 +10,45 @@ import pandas as pd
 import multiprocessing as mp
 
 from pathlib import Path
-from omegaconf import DictConfig
 
-from source.utils import initialize_df
-from utils import initialize_wandb, log_progress, seg_and_patch, seg_and_patch_slide_mp
+from source.utils import setup, write_config, initialize_df
+from utils import initialize_wandb, seg_and_patch, seg_and_patch_slide_mp
 
 
-@hydra.main(
-    version_base="1.2.0", config_path="config/extraction", config_name="default"
-)
-def main(cfg: DictConfig):
+def get_args_parser(add_help: bool = True):
+    parser = argparse.ArgumentParser("HS2P", add_help=add_help)
+    parser.add_argument("--config-file", default="", metavar="FILE", help="path to config file")
+    parser.add_argument(
+        "opts",
+        help="Modify config options at the end of the command using 'path.key=value'",
+        default=None,
+        nargs=argparse.REMAINDER,
+    )
+    parser.add_argument(
+        "--output-dir",
+        "--output_dir",
+        default=None,
+        type=str,
+        help="Output directory to save logs and checkpoints",
+    )
+    return parser
+
+
+def log_progress(processed_count, stop_logging, ntot):
+    previous_count = 0
+    while not stop_logging.is_set():
+        time.sleep(1)
+        current_count = processed_count.value
+        if previous_count != current_count:
+            wandb.log({"processed": current_count})
+            previous_count = current_count
+        if current_count >= ntot:
+            break
+
+
+def main(args):
+
+    cfg = setup(args, "extraction")
 
     run_id = datetime.datetime.now().strftime("%Y-%m-%d_%H_%M")
     # set up wandb
@@ -30,34 +60,29 @@ def main(cfg: DictConfig):
 
     output_dir = Path(cfg.output_dir, cfg.experiment_name)
     output_dir.mkdir(parents=True, exist_ok=True)
+    cfg.output_dir = str(output_dir)
+
+    write_config(cfg, cfg.output_dir)
 
     mask_save_dir = Path(output_dir, "masks")
     patch_save_dir = Path(
         output_dir,
         "patches",
         f"{cfg.patch_params.patch_size}",
-        f"{cfg.patch_params.format}",
     )
     visu_save_dir = Path(output_dir, "visualization", f"{cfg.patch_params.patch_size}")
 
-    directories = {
-        "mask_save_dir": mask_save_dir,
-        "patch_save_dir": patch_save_dir,
-        "visu_save_dir": visu_save_dir,
-    }
+    exist_ok = False
+    if cfg.resume:
+        exist_ok = True
+    if cfg.seg_params.visualize_mask:
+        mask_save_dir.mkdir(parents=True, exist_ok=exist_ok)
+    if cfg.flags.patch:
+        patch_save_dir.mkdir(parents=True, exist_ok=exist_ok)
+    if cfg.flags.visu:
+        visu_save_dir.mkdir(parents=True, exist_ok=exist_ok)
 
-    for dirname, dirpath in directories.items():
-        if not cfg.resume:
-            dirpath.mkdir(parents=True)
-        else:
-            dirpath.mkdir(parents=True, exist_ok=True)
-
-    if cfg.slide_csv.endswith(".txt"):
-        with open(cfg.slide_csv, "r") as f:
-            slide_paths = [x.strip() for x in f.readlines()]
-        slide_df = pd.DataFrame.from_dict({"slide_path": slide_paths})
-    else:
-        slide_df = pd.read_csv(cfg.slide_csv)
+    slide_df = pd.read_csv(cfg.csv)
 
     process_list_fp = None
     if Path(output_dir, "process_list.csv").is_file() and cfg.resume:
@@ -71,39 +96,33 @@ def main(cfg: DictConfig):
 
     if cfg.speed.multiprocessing:
 
-        slide_paths = slide_df.slide_path.values.tolist()
-        mask_paths = []
-        if "segmentation_mask_path" in slide_df.columns:
-            mask_paths = slide_df.segmentation_mask_path.values.tolist()
-        spacings = []
-        if "spacing" in slide_df.columns:
-            spacings = slide_df.spacing.values.tolist()
-
         if process_list_fp is None:
             df = initialize_df(
-                slide_paths,
-                mask_paths,
-                spacings,
+                slide_df,
                 cfg.seg_params,
                 cfg.filter_params,
                 cfg.vis_params,
                 cfg.patch_params,
             )
         else:
-            df = pd.read_csv(process_list_fp)
+            process_list_df = pd.read_csv(process_list_fp)
             df = initialize_df(
-                df, cfg.seg_params, cfg.filter_params, cfg.vis_params, cfg.patch_params
+                process_list_df, cfg.seg_params, cfg.filter_params, cfg.vis_params, cfg.patch_params
             )
 
         mask = df["process"] == 1
         process_stack = df[mask]
+        total = len(process_stack)
+        already_processed = len(df) - total
+
+        processed_count = mp.Value("i", already_processed)
 
         slide_ids_to_process = process_stack.slide_id
-        slide_paths_to_process = process_stack.slide_path
+        slide_paths_to_process = [Path(x) for x in process_stack.slide_path]
 
         mask_paths_to_process = [None] * len(slide_paths_to_process)
         if "segmentation_mask_path" in process_stack.columns:
-            mask_paths_to_process = process_stack.segmentation_mask_path
+            mask_paths_to_process = [Path(x) for x in process_stack.segmentation_mask_path]
 
         spacings_to_process = [None] * len(slide_paths_to_process)
         if "spacing" in process_stack.columns:
@@ -135,9 +154,6 @@ def main(cfg: DictConfig):
             )
         ]
 
-        total = len(args)
-        processed_count = mp.Value("i", 0)
-
         # start the logging thread
         if cfg.wandb.enable:
             stop_logging = threading.Event()
@@ -152,55 +168,73 @@ def main(cfg: DictConfig):
                 pool.imap_unordered(seg_and_patch_slide_mp, args),
                 desc="Patch extraction",
                 unit=" slide",
-                total=total,
+                initial=already_processed,
+                total=total+already_processed,
             ):
                 results.append(r)
                 if r[0] is not None:
                     with processed_count.get_lock():
                         processed_count.value += 1
+                t_df, sid, s, e, tb, vl, sl, pt = r
+                mask = df["slide_id"] == sid
+                df.loc[mask, "status"] = s
+                df.loc[mask, "error"] = e
+                df.loc[mask, "traceback"] = tb
+                df.loc[mask, "process"] = 0
+                df.loc[mask, "process_time"] = pt
+                if t_df is not None:
+                    df.loc[mask, "vis_level"] = vl
+                    df.loc[mask, "seg_level"] = sl
+                df.to_csv(Path(output_dir, f"process_list.csv"), index=False)
 
-        avg_process_time = round(
-            np.mean(
-                [r[-1] for r in results if (r[0] is not None and r[-1] is not None)]
-            ),
-            2,
-        )
-        min_process_time = round(
-            np.min(
-                [r[-1] for r in results if (r[0] is not None and r[-1] is not None)]
-            ),
-            2,
-        )
-        max_process_time = round(
-            np.max(
-                [r[-1] for r in results if (r[0] is not None and r[-1] is not None)]
-            ),
-            2,
-        )
+        if processed_count.value > 0:
+            avg_process_time = round(
+                np.mean(
+                    [r[-1] for r in results if (r[0] is not None and r[-1] is not None)]
+                ),
+                2,
+            )
+            min_process_time = round(
+                np.min(
+                    [r[-1] for r in results if (r[0] is not None and r[-1] is not None)]
+                ),
+                2,
+            )
+            max_process_time = round(
+                np.max(
+                    [r[-1] for r in results if (r[0] is not None and r[-1] is not None)]
+                ),
+                2,
+            )
+
         if cfg.wandb.enable:
             stop_logging.set()
             logging_thread.join()
             wandb.log({"processed": processed_count.value})
-            wandb.log({"avg_time_sec": avg_process_time})
-            wandb.log({"min_time_sec": min_process_time})
-            wandb.log({"max_time_sec": max_process_time})
+            if processed_count.value > 0:
+                wandb.log({"avg_time_sec": avg_process_time})
+                wandb.log({"min_time_sec": min_process_time})
+                wandb.log({"max_time_sec": max_process_time})
 
         dfs = []
-        for t_df, sid, s, vl, sl, pt in results:
+        for t_df, sid, s, e, tb, vl, sl, pt in results:
 
             mask = df["slide_id"] == sid
             df.loc[mask, "status"] = s
+            df.loc[mask, "error"] = e
+            df.loc[mask, "traceback"] = tb
             df.loc[mask, "process"] = 0
-            df.loc[mask, "vis_level"] = vl
-            df.loc[mask, "seg_level"] = sl
             df.loc[mask, "process_time"] = pt
-
-            dfs.append(t_df)
+            if t_df is not None:
+                df.loc[mask, "vis_level"] = vl
+                df.loc[mask, "seg_level"] = sl
+                dfs.append(t_df)
 
         df.to_csv(Path(output_dir, "process_list.csv"), index=False)
 
-        tile_df = pd.concat(dfs, ignore_index=True)
-        tile_df.to_csv(Path(output_dir, "tiles.csv"), index=False)
+        if len(dfs) > 0:
+            tile_df = pd.concat(dfs, ignore_index=True)
+            tile_df.to_csv(Path(output_dir, "tiles.csv"), index=False)
 
     else:
 
@@ -226,4 +260,5 @@ def main(cfg: DictConfig):
 
 if __name__ == "__main__":
 
-    main()
+    args = get_args_parser(add_help=True).parse_args()
+    main(args)

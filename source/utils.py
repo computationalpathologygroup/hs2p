@@ -1,3 +1,4 @@
+import os
 import cv2
 import time
 import h5py
@@ -7,7 +8,43 @@ import seaborn as sns
 
 from PIL import Image
 from pathlib import Path
+from omegaconf import OmegaConf
 from typing import Optional, Tuple, Dict, List
+
+from config import default_extraction_config, default_sampling_config
+
+
+def write_config(cfg, output_dir, name="config.yaml"):
+    print(OmegaConf.to_yaml(cfg))
+    saved_cfg_path = Path(output_dir, name)
+    with open(saved_cfg_path, "w") as f:
+        OmegaConf.save(config=cfg, f=f)
+    return saved_cfg_path
+
+
+def get_cfg_from_args(args, default_config):
+    if args.output_dir is not None:
+        args.output_dir = os.path.abspath(args.output_dir)
+        args.opts += [f"output_dir={args.output_dir}"]
+    default_cfg = OmegaConf.create(default_config)
+    cfg = OmegaConf.load(args.config_file)
+    cfg = OmegaConf.merge(default_cfg, cfg, OmegaConf.from_cli(args.opts))
+    OmegaConf.resolve(cfg)
+    return cfg
+
+
+def setup(args, task):
+    """
+    Create configs and perform basic setups.
+    """
+    if task == "extraction":
+        default_config = default_extraction_config
+    elif task == "sampling":
+        default_config = default_sampling_config
+    else:
+        raise ValueError(f"Unknown task: {task}")
+    cfg = get_cfg_from_args(args, default_config)
+    return cfg
 
 
 def compute_time(start_time, end_time):
@@ -18,9 +55,7 @@ def compute_time(start_time, end_time):
 
 
 def initialize_df(
-    slides,
-    masks,
-    spacings,
+    slide_df,
     seg_params,
     filter_params,
     vis_params,
@@ -30,29 +65,22 @@ def initialize_df(
     """
     initiate a pandas df describing a list of slides to process
     args:
-            slides (df or list): list of slide filepath
-                    if df, these paths assumed to be stored under the 'slide_path' column
-            masks (list): list of slides' segmentation masks filepath
-            spacings (list): list of slides' spacing at level 0
+            slide_df (pd.DataFrame): dataframe with slide ids and paths
             seg_params (dict): segmentation paramters
             filter_params (dict): filter parameters
             vis_params (dict): visualization paramters
             patch_params (dict): patching paramters
             use_heatmap_args (bool): whether to include heatmap arguments such as ROI coordinates
     """
-    total = len(slides)
-    if isinstance(slides, pd.DataFrame):
-        slide_ids = list(slides.slide_id.values)
-        slide_paths = list(slides.slide_path.values)
-        if "segmentation_mask_path" in slides.columns:
-            mask_paths = list(slides.segmentation_mask_path.values)
-        if "spacing" in slides.columns:
-            slide_spacings = list(slides.spacing.values)
-    else:
-        slide_ids = [Path(s).stem for s in slides]
-        slide_paths = slides.copy()
-        mask_paths = masks.copy()
-        slide_spacings = spacings.copy()
+    total = len(slide_df)
+    slide_ids = list(slide_df.slide_id.values)
+    slide_paths = list(slide_df.slide_path.values)
+    mask_paths = []
+    if "segmentation_mask_path" in slide_df.columns:
+        mask_paths = list(slide_df.segmentation_mask_path.values)
+    slide_spacings = []
+    if "spacing" in slide_df.columns:
+        slide_spacings = list(slide_df.spacing.values)
     default_df_dict = {
         "slide_id": slide_ids,
         "slide_path": slide_paths,
@@ -70,9 +98,11 @@ def initialize_df(
         {
             "process": np.full((total), 1, dtype=np.uint8),
             "status": np.full((total), "tbp"),
+            "error": np.full((total), "none"),
+            "traceback": np.full((total), "none"),
             "has_patches": np.full((total), "tbd"),
             # seg params
-            "seg_level": np.full((total), int(seg_params["seg_level"]), dtype=np.int8),
+            "seg_level": np.full((total), -1, dtype=np.int8),
             "sthresh": np.full((total), int(seg_params["sthresh"]), dtype=np.uint8),
             "mthresh": np.full((total), int(seg_params["mthresh"]), dtype=np.uint8),
             "close": np.full((total), int(seg_params["close"]), dtype=np.uint32),
@@ -84,7 +114,7 @@ def initialize_df(
                 (total), int(filter_params["max_n_holes"]), dtype=np.uint32
             ),
             # vis params
-            "vis_level": np.full((total), int(vis_params["vis_level"]), dtype=np.int8),
+            "vis_level": np.full((total), -1, dtype=np.int8),
             "line_thickness": np.full(
                 (total), int(vis_params["line_thickness"]), dtype=np.uint32
             ),
@@ -108,22 +138,19 @@ def initialize_df(
             }
         )
 
-    if isinstance(slides, pd.DataFrame):
-        temp_copy = pd.DataFrame(
-            default_df_dict
-        )  # temporary dataframe w/ default params
-        # find key in provided df
-        # if exist, fill empty fields w/ default values, else, insert the default values as a new column
-        for key in default_df_dict.keys():
-            if key in slides.columns:
-                mask = slides[key].isna()
-                slides.loc[mask, key] = temp_copy.loc[mask, key]
-            else:
-                slides.insert(len(slides.columns), key, default_df_dict[key])
-    else:
-        slides = pd.DataFrame(default_df_dict)
+    temp_copy = pd.DataFrame(
+        default_df_dict
+    )  # temporary dataframe w/ default params
+    # find key in provided df
+    # if exist, fill empty fields w/ default values, else, insert the default values as a new column
+    for key in default_df_dict.keys():
+        if key in slide_df.columns:
+            mask = slide_df[key].isna()
+            slide_df.loc[mask, key] = temp_copy.loc[mask, key]
+        else:
+            slide_df.insert(len(slide_df.columns), key, default_df_dict[key])
 
-    return slides
+    return slide_df
 
 
 def save_hdf5(output_path, asset_dict, attr_dict=None, mode="a"):
@@ -151,6 +178,29 @@ def save_hdf5(output_path, asset_dict, attr_dict=None, mode="a"):
             dset.resize(len(dset) + data_shape[0], axis=0)
             dset[-data_shape[0] :] = val
     file.close()
+    return output_path
+
+
+def save_npy(output_path, asset_dict, attr_dict, mode="a"):
+    coords = asset_dict["coords"]
+    x = list(coords[:, 0])  # defined w.r.t level 0
+    y = list(coords[:, 1])  # defined w.r.t level 0
+    npatch = len(x)
+    attr = attr_dict["coords"]
+    patch_level = attr["patch_level"]
+    patch_size = attr["patch_size"]
+    patch_size_resized = attr["patch_size_resized"]
+    resize_factor = int(patch_size_resized // patch_size)
+    data = []
+    for i in range(npatch):
+        data.append([x[i], y[i], patch_size_resized, patch_level, resize_factor])
+    data_arr = np.array(data, dtype=int)
+    if mode == "a":
+        existing_arr = np.load(output_path)
+        combined_arr = np.append(existing_arr, data_arr, axis=0)
+        np.save(output_path, combined_arr)
+    else:
+        np.save(output_path, data_arr)
     return output_path
 
 
@@ -252,11 +302,10 @@ def initialize_hdf5_bag(first_patch, save_coord=False):
 def overlay_mask_on_slide(
     wsi_object,
     mask_object,
-    vis_level: int,
+    downsample: int,
     pixel_mapping: Dict[str, int],
     color_mapping: Optional[Dict[str, List[int]]] = None,
     alpha: float = 0.5,
-    downsample: int = -1,
 ):
     """
     Show a mask overlayed on a slide
@@ -269,15 +318,8 @@ def overlay_mask_on_slide(
 
     assert x_mask == wsi_object.level_dimensions[mask_min_level][0]
 
-    if vis_level < 0:
-        if len(wsi_object.level_dimensions) == 1:
-            vis_level = 0
-            assert mask_min_level == 0
-        else:
-            vis_level = wsi_object.get_best_level_for_downsample_custom(downsample)
-            vis_level = max(vis_level, mask_min_level)
-    else:
-        vis_level = max(vis_level, mask_min_level)
+    vis_level = wsi_object.get_best_level_for_downsample_custom(downsample)
+    vis_level = max(vis_level, mask_min_level)
 
     mask_vis_level = vis_level - mask_min_level
 
@@ -373,7 +415,7 @@ def get_masked_tile(
     upsample: bool = True,
     eps: float = 1e-5,
 ):
-    wsi_spacing_level = wsi_object.get_best_level_for_spacing(
+    wsi_spacing_level, _ = wsi_object.get_best_level_for_spacing(
         spacing, ignore_warning=True
     )
 
@@ -381,9 +423,11 @@ def get_masked_tile(
     mask_min_level = int(
         np.argmin([abs(x_wsi - x_mask) for x_wsi, _ in wsi_object.level_dimensions])
     )
-    mask_spacing_level = mask_object.get_best_level_for_spacing(
+    mask_spacing_level, _ = mask_object.get_best_level_for_spacing(
         spacing, ignore_warning=True
     )
+    mask_spacing = mask_object.get_level_spacing(mask_spacing_level)
+    mask_resize_factor = int(round(spacing / mask_spacing, 0))
 
     assert x_mask == wsi_object.level_dimensions[mask_min_level][0]
 
@@ -397,6 +441,7 @@ def get_masked_tile(
         )
     )
     x_scaled, y_scaled = int(x * 1.0 / mask_scale[0]), int(y * 1.0 / mask_scale[1])
+
     # need to scale tile size from wsi_spacing_level to mask_spacing_level
     ts_scale = tuple(
         a / b
@@ -408,14 +453,23 @@ def get_masked_tile(
     ts_x, ts_y = int(patch_size[0] * 1.0 / ts_scale[0]), int(
         patch_size[1] * 1.0 / ts_scale[1]
     )
+
+    # further scale tile size with resize factor
+    ts_x_resized, ts_y_resized = ts_x * mask_resize_factor, ts_y * mask_resize_factor
+
     # read annotation tile from mask
     masked_tile = mask_object.wsi.get_patch(
-        x_scaled, y_scaled, ts_x, ts_y, spacing=spacing, center=False
+        x_scaled, y_scaled, ts_x_resized, ts_y_resized, spacing=mask_spacing, center=False
     )
     if masked_tile.shape[-1] == 1:
         masked_tile = np.squeeze(masked_tile, axis=-1)
     masked_tile = Image.fromarray(masked_tile)
     masked_tile = masked_tile.split()[0]
+
+    # may need to resize tile
+    if mask_resize_factor != 1:
+        masked_tile = masked_tile.resize((ts_x, ts_y))
+
     if ts_scale[0] > (1 + eps) or ts_scale[1] > (1 + eps):
         # 2 possible ways to go:
         # - upsample annotation tile to match true tile size
@@ -507,7 +561,7 @@ def DrawMapFromCoords(
     canvas,
     wsi_object,
     coords,
-    patch_size,
+    patch_size_at_0,
     vis_level: int,
     indices: Optional[List[int]] = None,
     draw_grid: bool = True,
@@ -525,8 +579,8 @@ def DrawMapFromCoords(
     total = len(indices)
 
     patch_size = tuple(
-        np.ceil((np.array(patch_size) / np.array(downsamples))).astype(np.int32)
-    )
+        np.ceil((np.array(patch_size_at_0) / np.array(downsamples))).astype(np.int32)
+    ) # defined w.r.t vis_level
     if verbose:
         print(f"downscaled patch size: {patch_size}")
 
@@ -535,7 +589,10 @@ def DrawMapFromCoords(
         patch_id = indices[idx]
         coord = coords[patch_id]
         x, y = coord
-        vis_spacing = wsi_object.get_level_spacing(vis_level)
+        target_vis_spacing = wsi_object.get_level_spacing(vis_level)
+
+        vis_spacing = target_vis_spacing
+        resize_factor = 1
 
         if mask_object is not None:
             # ensure mask and slide have at least one common spacing
@@ -547,24 +604,29 @@ def DrawMapFromCoords(
             ), f"The provided segmentation mask (spacings={mask_object.spacings}) has no common spacing with the slide (spacings={wsi_object.spacings}). A minimum of 1 common spacing is required."
 
             # check if this spacing is present in common spacings
-            is_in_common_spacings = vis_spacing in [s for s, _ in common_spacings]
+            is_in_common_spacings = target_vis_spacing in [s for s, _ in common_spacings]
             if not is_in_common_spacings:
                 # find spacing that is common to slide and mask and that is the closest to seg_spacing
-                closest = np.argmin([abs(vis_spacing - s) for s, _ in common_spacings])
+                closest = np.argmin([abs(target_vis_spacing - s) for s, _ in common_spacings])
                 closest_common_spacing = common_spacings[closest][0]
                 vis_spacing = closest_common_spacing
-                vis_level = wsi_object.get_best_level_for_spacing(vis_spacing)
+                vis_level, _ = wsi_object.get_best_level_for_spacing(vis_spacing)
+                vis_spacing = wsi_object.get_level_spacing(vis_level)
+                resize_factor = int(round(target_vis_spacing / vis_spacing, 0))
 
-        width, height = patch_size
+        width, height = patch_size * resize_factor
         tile = wsi_object.wsi.get_patch(
             x, y, width, height, spacing=vis_spacing, center=False
         )
+        tile = Image.fromarray(tile).convert("RGB")
+        if resize_factor != 1:
+            tile = tile.resize((patch_size, patch_size))
 
         if mask_object is not None:
             tile, masked_tile = get_masked_tile(
                 wsi_object,
                 mask_object,
-                Image.fromarray(tile).convert("RGB"),
+                tile,
                 x,
                 y,
                 vis_spacing,
@@ -573,7 +635,8 @@ def DrawMapFromCoords(
             tile = overlay_mask_on_tile(
                 tile, masked_tile, pixel_mapping, color_mapping, alpha=alpha
             )
-            tile = np.array(tile)
+
+        tile = np.array(tile)
 
         coord = np.ceil(
             tuple(coord[i] / downsamples[i] for i in range(len(coord)))
@@ -603,7 +666,7 @@ def VisualizeCoords(
     bg_color: Tuple[int] = (0, 0, 0),
     verbose: bool = False,
     key: str = "coords",
-    heatmap: Optional[Image.Image] = None,
+    canvas: Optional[Image.Image] = None,
     mask_object=None,
     pixel_mapping: Optional[Dict[str, int]] = None,
     color_mapping: Optional[Dict[str, int]] = None,
@@ -617,60 +680,56 @@ def VisualizeCoords(
     w, h = wsi_object.level_dimensions[0]
 
     if len(coords) == 0:
-        return heatmap
+        return canvas
 
     if verbose:
         print(f"original size: {w} x {h}")
 
     w, h = wsi_object.level_dimensions[vis_level]
 
-    patch_size = dset.attrs["patch_size_resized"]
     patch_level = dset.attrs["patch_level"]
+    patch_size = dset.attrs["patch_size_resized"] # defined w.r.t patch_level
     if verbose:
         print(f"downscaled size for stiching: {w} x {h}")
         print(f"number of patches: {len(coords)}")
-        print(f"patch size: {patch_size}")
         print(f"patch level: {patch_level}")
+        print(f"patch size: {patch_size}")
 
-    patch_size = tuple(
+    patch_size_at_0 = tuple(
         (
             np.array((patch_size, patch_size))
             * wsi_object.level_downsamples[patch_level]
         ).astype(np.int32)
-    )
-    if verbose:
-        print(f"ref patch size: {patch_size}")
+    ) # defined w.r.t level 0
 
     if w * h > Image.MAX_IMAGE_PIXELS:
         raise Image.DecompressionBombError(
             "Visualization Downscale %d is too large" % downscale
         )
 
-    if heatmap is None:
+    if canvas is None:
         if mask_object is not None:
-            heatmap = overlay_mask_on_slide(
+            canvas = overlay_mask_on_slide(
                 wsi_object,
                 mask_object,
-                vis_level,
+                downscale,
                 pixel_mapping,
                 color_mapping,
                 alpha=alpha,
             )
         elif display_slide:
             vis_spacing = wsi_object.spacings[vis_level]
-            heatmap = wsi_object.wsi.get_patch(
-                0, 0, w, h, spacing=vis_spacing, center=False
-            )
-            heatmap = Image.fromarray(heatmap).convert("RGB")
+            canvas = wsi_object.wsi.get_slide(spacing=vis_spacing)
+            canvas = Image.fromarray(canvas).convert("RGB")
         else:
-            heatmap = Image.new(size=(w, h), mode="RGB", color=bg_color)
+            canvas = Image.new(size=(w, h), mode="RGB", color=bg_color)
 
-    heatmap = np.array(heatmap)
-    heatmap = DrawMapFromCoords(
-        heatmap,
+    canvas = np.array(canvas)
+    canvas = DrawMapFromCoords(
+        canvas,
         wsi_object,
         coords,
-        patch_size,
+        patch_size_at_0,
         vis_level,
         indices=None,
         draw_grid=draw_grid,
@@ -683,4 +742,4 @@ def VisualizeCoords(
     )
 
     h5_file.close()
-    return heatmap
+    return canvas
